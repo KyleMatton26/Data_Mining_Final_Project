@@ -5,14 +5,14 @@ from collections import deque
 DATA_FILE = "data/datatraining.txt"
 
 # Choosing 30 since there is a data point at every minute so we use a sliding window for 30 mins
-WINDOW_SIZE = 30          
-STREAM_DELAY = 0.00       
-PRINT_EVERY = 30          
+WINDOW_SIZE = 30
+STREAM_DELAY = 0.00
+PRINT_EVERY = 30
 
 FEATURES = ["Temperature", "Humidity", "Light", "CO2", "HumidityRatio"]
 
 
-def parse_record(row):
+def parse_record(row) -> dict[str, float | int | str]:
     return {
         "date": row["date"].strip('"'),
         "Temperature": float(row["Temperature"]),
@@ -24,7 +24,7 @@ def parse_record(row):
     }
 
 
-def window_stats(window):
+def window_stats(window) -> dict[str, dict[str, float]]:
 
     stats = {}
     for feature in FEATURES:
@@ -62,7 +62,7 @@ def window_stats(window):
     return stats
 
 
-def print_summary(record_num, record, window, occupied_count, total_count):
+def print_summary(record_num, record, window, occupied_count, total_count) -> None:
 
     stats = window_stats(window)
     occ_pct = 100 * occupied_count / total_count if total_count else 0
@@ -79,7 +79,7 @@ def print_summary(record_num, record, window, occupied_count, total_count):
         print(f"  {feat:<16} {s['mean']:>8.3f}  {s['std']:>8.3f}  {s['min']:>8.3f}  {s['max']:>8.3f}")
 
 
-def stream(filepath):
+def stream(filepath) -> None:
     window = deque(maxlen=WINDOW_SIZE)
     total_count = 0
     occupied_count = 0

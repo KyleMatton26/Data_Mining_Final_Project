@@ -23,6 +23,15 @@ FEATURE_SCALES = {
 
 
 def parse_record(row) -> dict[str, float | int | str]:
+    """Parse a raw CSV row into a typed record dictionary.
+
+    Args:
+        row: A csv.DictReader row containing sensor and occupancy fields.
+
+    Returns:
+        A dict with keys: ``date`` (str), ``Temperature``, ``Humidity``,
+        ``Light``, ``CO2``, ``HumidityRatio`` (float), and ``Occupancy`` (int).
+    """
     return {
         "date": row["date"].strip('"'),
         "Temperature": float(row["Temperature"]),
@@ -35,7 +44,16 @@ def parse_record(row) -> dict[str, float | int | str]:
 
 
 def window_stats(window) -> dict[str, dict[str, float]]:
+    """Compute descriptive statistics for each feature over a sliding window.
 
+    Args:
+        window: An iterable of record dicts, each containing all keys in
+            ``FEATURES``.
+
+    Returns:
+        A dict mapping each feature name to a nested dict with keys
+        ``mean``, ``std``, ``min``, and ``max``.
+    """
     stats = {}
     for feature in FEATURES:
 
@@ -73,7 +91,19 @@ def window_stats(window) -> dict[str, dict[str, float]]:
 
 
 def print_summary(record_num, record, window, occupied_count, total_count) -> None:
+    """Print a formatted snapshot of the current stream position.
 
+    Displays the record number, timestamp, ground-truth occupancy, running
+    occupancy percentage, and a per-feature statistics table for the current
+    sliding window.
+
+    Args:
+        record_num: The 1-based index of the current record in the stream.
+        record: The current parsed record dict (output of ``parse_record``).
+        window: The current sliding window of record dicts.
+        occupied_count: Number of occupied records seen so far.
+        total_count: Total records processed so far.
+    """
     stats = window_stats(window)
     occ_pct = 100 * occupied_count / total_count if total_count else 0
 
@@ -90,14 +120,48 @@ def print_summary(record_num, record, window, occupied_count, total_count) -> No
 
 
 def normalize_features(record) -> list[float]:
+    """Return a normalized feature vector for a single record.
+
+    Each feature is divided by its corresponding scale factor in
+    ``FEATURE_SCALES`` so that all dimensions lie roughly in [0, 1].
+
+    Args:
+        record: A parsed record dict (output of ``parse_record``).
+
+    Returns:
+        A list of floats, one per feature in ``FEATURES``, in the same order.
+    """
     return [record[feat] / FEATURE_SCALES[feat] for feat in FEATURES]
 
 
 def distance_squared(a: list[float], b: list[float]) -> float:
+    """Compute the squared Euclidean distance between two feature vectors.
+
+    Args:
+        a: First feature vector.
+        b: Second feature vector. Must have the same length as ``a``.
+
+    Returns:
+        The sum of squared element-wise differences.
+    """
     return sum((x - y) ** 2 for x, y in zip(a, b))
 
 def _region_query(points: list[list[float]], idx: int, eps: float, eps_sq: float) -> list[int]:
-    """Indices of all points within eps Euclidean distance of points[idx]."""
+    """Return indices of all points within ``eps`` Euclidean distance of a query point.
+
+    Uses a per-dimension absolute-difference pre-filter before computing the
+    full squared distance to skip obviously distant points cheaply.
+
+    Args:
+        points: List of feature vectors.
+        idx: Index of the query point within ``points``.
+        eps: Neighborhood radius (Euclidean).
+        eps_sq: Pre-computed ``eps ** 2`` to avoid repeated squaring.
+
+    Returns:
+        A list of indices (including ``idx`` itself) whose Euclidean distance
+        to ``points[idx]`` is at most ``eps``.
+    """
     p = points[idx]
     result = []
     for j, q in enumerate(points):
@@ -112,9 +176,19 @@ def _region_query(points: list[list[float]], idx: int, eps: float, eps_sq: float
 
 
 def dbscan(points: list[list[float]], eps: float = DBSCAN_EPS, min_samples: int = DBSCAN_MIN_SAMPLES) -> list[int]:
-    """
-    DBSCAN clustering on a list of feature vectors.
-    Returns cluster labels; -1 means noise.
+    """Run DBSCAN clustering on a list of feature vectors.
+
+    Args:
+        points: List of feature vectors to cluster.
+        eps: Maximum Euclidean distance between two points for them to be
+            considered neighbors. Defaults to ``DBSCAN_EPS``.
+        min_samples: Minimum number of neighbors (including the point itself)
+            required for a point to be a core point. Defaults to
+            ``DBSCAN_MIN_SAMPLES``.
+
+    Returns:
+        A list of integer cluster labels, one per input point. A label of
+        ``-1`` indicates that the point was classified as noise.
     """
     n = len(points)
     labels = [-1] * n
@@ -234,7 +308,19 @@ def print_eval_metrics(y_true: list[int], y_pred: list[int], features: list[list
             print(f"  Silhouette Score:     N/A  (fewer than 2 non-noise clusters)")
 
 class StreamingKMeans:
+    """Online K-means clusterer that updates centroids incrementally.
+
+    Each call to ``update`` assigns the incoming point to the nearest
+    centroid and adjusts that centroid via a running mean, requiring only
+    O(k) memory regardless of stream length.
+    """
+
     def __init__(self, n_clusters: int = 2):
+        """Initialize the clusterer with empty centroids.
+
+        Args:
+            n_clusters: Number of clusters to maintain. Defaults to 2.
+        """
         self.n_clusters: int = n_clusters
         self.centroids: list[list[float]] = []
         self.counts: list[int] = []
@@ -243,12 +329,34 @@ class StreamingKMeans:
         ]
 
     def predict(self, features: list[float]) -> int:
+        """Assign a feature vector to the nearest cluster centroid.
+
+        Args:
+            features: Normalized feature vector to classify.
+
+        Returns:
+            Index of the nearest centroid, or ``0`` if no centroids exist yet.
+        """
         if not self.centroids:
             return 0
         distances = [distance_squared(features, centroid) for centroid in self.centroids]
         return min(range(len(distances)), key=lambda i: distances[i])
 
     def update(self, features: list[float], occupancy: int) -> int:
+        """Assign a point to a cluster and update the centroid incrementally.
+
+        If fewer than ``n_clusters`` centroids have been initialized, the
+        point seeds a new centroid. Otherwise the point is assigned to the
+        nearest existing centroid, whose running mean is then updated.
+
+        Args:
+            features: Normalized feature vector of the incoming data point.
+            occupancy: Ground-truth occupancy label (0 or 1) used to track
+                per-cluster label distributions for later majority voting.
+
+        Returns:
+            The cluster index to which the point was assigned.
+        """
         if len(self.centroids) < self.n_clusters:
             self.centroids.append(features.copy())
             self.counts.append(0)
@@ -267,16 +375,27 @@ class StreamingKMeans:
         return label
 
     def best_cluster_label(self, cluster_id: int) -> int:
+        """Return the majority occupancy label for a cluster via ground-truth counts.
+
+        Args:
+            cluster_id: Index of the cluster to evaluate.
+
+        Returns:
+            ``1`` if more occupied than unoccupied points were assigned to the
+            cluster, otherwise ``0``.
+        """
         truth_counts = self.cluster_truth[cluster_id]
         return 1 if truth_counts[1] >= truth_counts[0] else 0
 
     def cluster_mapping(self) -> dict[int, int]:
+        """Build a majority-vote mapping from cluster index to occupancy label.
+
+        Returns:
+            A dict where each key is a cluster index and the value is the
+            predicted occupancy label (0 or 1) based on the accumulated
+            ground-truth counts for that cluster.
+        """
         return {cluster_id: self.best_cluster_label(cluster_id) for cluster_id in range(len(self.centroids))}
-
-
-# ---------------------------------------------------------------------------
-# Streaming DBSCAN
-# ---------------------------------------------------------------------------
 
 class StreamingDBSCAN:
     """
@@ -300,6 +419,17 @@ class StreamingDBSCAN:
         self.class_counts: dict[int, int] = {0: 0, 1: 0}
 
     def update(self, features: list[float], occupancy: int) -> None:
+        """Ingest a new data point into the sliding window and update class centroids.
+
+        The point is appended to both the feature and truth windows (oldest
+        entries are automatically evicted when the window is full). The
+        running centroid for the point's occupancy class is also updated so
+        that anchor injection in ``fit`` reflects current class statistics.
+
+        Args:
+            features: Normalized feature vector of the incoming data point.
+            occupancy: Ground-truth occupancy label (0 or 1).
+        """
         self.feature_window.append(features)
         self.truth_window.append(occupancy)
         self.class_counts[occupancy] += 1
@@ -367,6 +497,17 @@ class StreamingDBSCAN:
         return predicted
     
 def stream_kmeans(filepath) -> None:
+    """Run online K-means over a CSV data stream and print evaluation metrics.
+
+    Reads the file one record at a time, updating a ``StreamingKMeans``
+    clusterer incrementally. Every ``PRINT_EVERY`` records the window
+    accuracy is printed to stdout. A final summary with per-cluster
+    statistics and validation metrics is printed at the end of the stream.
+
+    Args:
+        filepath: Path to the CSV data file (must follow the training-data
+            format with a quoted header row).
+    """
     clusterer = StreamingKMeans(n_clusters=2)
     total_count = 0
     feature_window: deque = deque(maxlen=STREAM_WINDOW)
@@ -438,6 +579,18 @@ def stream_kmeans(filepath) -> None:
 
 
 def stream_dbscan(filepath) -> None:
+    """Run sliding-window DBSCAN over a CSV data stream and print evaluation metrics.
+
+    Reads the file one record at a time, updating a ``StreamingDBSCAN``
+    clusterer. Every ``PRINT_EVERY`` records (once the window is large enough)
+    DBSCAN is re-fit on the current window and a progress line is printed.
+    A final summary with per-cluster breakdowns and validation metrics is
+    printed at the end of the stream.
+
+    Args:
+        filepath: Path to the CSV data file (must follow the training-data
+            format with a quoted header row).
+    """
     clusterer = StreamingDBSCAN()
     total_count = 0
 
@@ -513,6 +666,17 @@ def stream_dbscan(filepath) -> None:
 
 
 def stream(filepath) -> None:
+    """Stream raw sensor records from a CSV file and print rolling statistics.
+
+    Reads the file one record at a time, maintaining a sliding window of the
+    most recent ``WINDOW_SIZE`` records. Every ``PRINT_EVERY`` records a
+    summary table of per-feature statistics is printed. A final summary with
+    overall occupancy rates and window stats is printed after the stream ends.
+
+    Args:
+        filepath: Path to the CSV data file (must follow the training-data
+            format with a quoted header row).
+    """
     window = deque(maxlen=WINDOW_SIZE)
     total_count = 0
     occupied_count = 0
